@@ -215,6 +215,11 @@
                 addLogEntry(`❌ Error: ${data.error}`);
                 setTimeout(() => { window.location.href = '/'; }, 2000);
               }
+              // Detect stuck job: no progress for 9+ consecutive polls (90 seconds)
+              else if (data.stuck_polls >= 9) {
+                addLogEntry('⚠️ Analysis appears stuck (no progress for 90s). Attempting recovery...');
+                setTimeout(() => { window.location.href = buildUrl('/report'); }, 2000);
+              }
               // Job still running — keep polling
               else if (data.status === 'running' && attempts < maxAttempts) {
                 addLogEntry(`Still working... (check ${attempts}/${maxAttempts})`);
