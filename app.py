@@ -370,7 +370,8 @@ def generate():
         "loading.html",
         your_company=your_company,
         competitors=competitors,
-        phase="channels"
+        phase="channels",
+        job_id=job_id
     )
 
 
@@ -495,7 +496,8 @@ def confirm_channels():
         "loading.html",
         your_company=your_company,
         competitors=competitors,
-        phase="analysis"
+        phase="analysis",
+        job_id=job_id
     )
 
 
@@ -552,7 +554,7 @@ def quota_exhausted():
 
 @app.route("/report")
 def report():
-    job_id = session.get("job_id")
+    job_id = request.args.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         return redirect(url_for("index"))
 
@@ -576,7 +578,7 @@ def report():
 
 @app.route("/download")
 def download():
-    job_id = session.get("job_id")
+    job_id = request.args.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         return "No report found. Please generate a report first.", 400
 
