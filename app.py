@@ -271,6 +271,9 @@ def run_channel_finding(job_id, your_company, competitors):
         jobs[job_id]["company_context"] = company_context
         jobs[job_id]["channels_done"]   = True
 
+        # ── KEY FIX: save Phase 1 results to disk so they survive Render worker restarts ──
+        _save_job_to_disk(job_id, jobs[job_id])
+
     except QuotaExhaustedError as e:
         jobs[job_id]["quota_exhausted"] = True
         jobs[job_id]["channels_done"]   = True
@@ -390,6 +393,9 @@ def generate():
 
     job_id = f"{your_company}_{int(time.time())}"
     jobs[job_id] = {
+        # User input (persisted for session loss recovery)
+        "your_company": your_company,
+        "competitors":  competitors,
         # Phase 1
         "channel_status":  [],
         "channel_data":    None,
@@ -474,16 +480,21 @@ def verify_channels():
     """Show found channels to user for verification / editing."""
     # Accept job_id from URL param OR session
     job_id = request.args.get("job_id") or session.get("job_id")
-    if not job_id or job_id not in jobs:
+    if not job_id:
         return redirect(url_for("index"))
 
-    job = jobs[job_id]
+    # ── KEY FIX: restore from disk if Render wiped the in-memory jobs dict ──
+    job = _ensure_job_in_memory(job_id)
+    if not job:
+        return redirect(url_for("index"))
+
     if not job.get("channels_done") or job.get("channel_error"):
         return redirect(url_for("index"))
 
     all_data     = job["channel_data"]
-    your_company = session.get("your_company", "")
-    competitors  = session.get("competitors", [])
+    # Fallback: try session, then extract from job if session lost
+    your_company = session.get("your_company", "") or job.get("your_company", "")
+    competitors  = session.get("competitors", []) or job.get("competitors", [])
 
     return render_template(
         "verify_channels.html",
@@ -501,13 +512,18 @@ def confirm_channels():
     Updates all_data with any user-edited channel URLs, then starts Phase 2.
     """
     job_id = request.form.get("job_id") or session.get("job_id")
-    if not job_id or job_id not in jobs:
+    if not job_id:
         return redirect(url_for("index"))
 
-    job          = jobs[job_id]
+    # ── KEY FIX: restore from disk if Render wiped the in-memory jobs dict ──
+    job = _ensure_job_in_memory(job_id)
+    if not job:
+        return redirect(url_for("index"))
+
     all_data     = job["channel_data"]
-    your_company = session.get("your_company", "")
-    competitors  = session.get("competitors", [])
+    # Fallback: try session, then extract from job if session lost
+    your_company = session.get("your_company", "") or job.get("your_company", "")
+    competitors  = session.get("competitors", []) or job.get("competitors", [])
 
     # Apply any user-edited channel URLs
     for i, d in enumerate(all_data):

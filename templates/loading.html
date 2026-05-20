@@ -199,7 +199,9 @@
           fetch(buildUrl('/report'), { method: 'HEAD', redirect: 'manual' })
             .then(res => {
               // If /report returns 200, the result is ready. Redirect.
-              if (res.status === 200 || res.type === 'opaqueredirect') {
+              // IMPORTANT: res.type === 'opaqueredirect' means ANY redirect (including 302 "not ready").
+              // ONLY redirect when status is exactly 200.
+              if (res.status === 200) {
                 addLogEntry('✅ Report ready! Loading now...');
                 window.location.href = buildUrl('/report');
               } else if (attempts < maxAttempts) {
