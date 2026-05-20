@@ -189,35 +189,55 @@
         // Phase 1 is short — just redirect with job_id
         setTimeout(() => { window.location.href = buildUrl('/verify-channels'); }, 2000);
       } else {
-        // Phase 2 can be 3-4 min. Poll until the job is done on disk.
+        // Phase 2 can be 3-4 min. Poll /status until the job is done.
         addLogEntry('Analysis still running. Polling every 10 seconds...');
         let attempts = 0;
-        const maxAttempts = 30;  // up to 5 minutes of polling
+        const maxAttempts = 60;  // up to 10 minutes of polling
 
         function poll() {
           attempts++;
-          fetch(buildUrl('/report'), { method: 'HEAD', redirect: 'manual' })
-            .then(res => {
-              // If /report returns 200, the result is ready. Redirect.
-              // IMPORTANT: res.type === 'opaqueredirect' means ANY redirect (including 302 "not ready").
-              // ONLY redirect when status is exactly 200.
-              if (res.status === 200) {
+          // Use /status endpoint to check job state (better than checking /report redirect)
+          fetch(buildUrl('/status'))
+            .then(res => res.json())
+            .then(data => {
+              // Job completed successfully
+              if (data.status === 'done' && !data.error && !data.quota_exhausted) {
                 addLogEntry('✅ Report ready! Loading now...');
                 window.location.href = buildUrl('/report');
-              } else if (attempts < maxAttempts) {
-                // Not ready yet — keep polling
+              }
+              // Job hit quota limit
+              else if (data.quota_exhausted) {
+                addLogEntry('⛔ YouTube API quota exhausted.');
+                window.location.href = '/quota-exhausted';
+              }
+              // Job encountered an error
+              else if (data.error) {
+                addLogEntry(`❌ Error: ${data.error}`);
+                setTimeout(() => { window.location.href = '/'; }, 2000);
+              }
+              // Job still running — keep polling
+              else if (data.status === 'running' && attempts < maxAttempts) {
                 addLogEntry(`Still working... (check ${attempts}/${maxAttempts})`);
                 setTimeout(poll, 10000);
-              } else {
-                addLogEntry('⏱ Timed out. Please try again or check your API keys.');
+              }
+              // Job lost (not in memory or disk)
+              else if (data.status === 'lost' || data.error === 'Job not found') {
+                addLogEntry('⚠️ Job state lost. Redirecting...');
+                setTimeout(() => { window.location.href = buildUrl('/report'); }, 2000);
+              }
+              // Timeout after max attempts
+              else if (attempts >= maxAttempts) {
+                addLogEntry('⏱ Timed out (10 minutes). Check your API keys or try again.');
                 setTimeout(() => { window.location.href = '/'; }, 3000);
               }
             })
-            .catch(() => {
+            .catch(err => {
               if (attempts < maxAttempts) {
+                addLogEntry(`Poll error: ${err.message}. Retrying...`);
                 setTimeout(poll, 10000);
               } else {
-                window.location.href = '/';
+                addLogEntry('⏱ Polling failed. Please try again.');
+                setTimeout(() => { window.location.href = '/'; }, 2000);
               }
             });
         }

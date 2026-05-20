@@ -609,6 +609,30 @@ def progress():
     )
 
 
+@app.route("/status")
+def status():
+    """
+    Return job status for polling.
+    Used by loading.html when SSE drops to check if analysis is complete.
+    """
+    job_id = request.args.get("job_id") or session.get("job_id")
+    if not job_id:
+        return {"error": "No job_id", "status": "unknown"}, 400
+
+    job = _ensure_job_in_memory(job_id)
+    if not job:
+        return {"error": "Job not found", "status": "lost"}, 404
+
+    return {
+        "job_id": job_id,
+        "status": "done" if job.get("done") else "running",
+        "phase": "channels" if job.get("channels_done") else "analysis",
+        "error": job.get("error"),
+        "quota_exhausted": job.get("quota_exhausted", False),
+        "message_count": len(job.get("status", [])),
+    }, 200
+
+
 @app.route("/quota-exhausted")
 def quota_exhausted():
     """Shown when all YouTube API keys have hit their daily quota."""

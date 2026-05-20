@@ -172,6 +172,8 @@
     </div>
 
     <form method="POST" action="/confirm-channels" id="confirmForm">
+      <!-- KEY FIX: pass job_id in form so it survives session loss on Render -->
+      <input type="hidden" name="job_id" value="{{ job_id }}"/>
       <div class="channels-list">
         {% for d in all_data %}
         {% set ck = d.company_name | replace(" ", "_") | lower %}
