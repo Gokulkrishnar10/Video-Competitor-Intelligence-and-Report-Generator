@@ -17,12 +17,22 @@ Routes:
 Pipeline:
   Phase 1: youtube_fetcher (channels only) → /verify-channels
   Phase 2: transcriber → analyser → insights → quality_gate → report_builder
+
+Render-survival fixes (v3):
+  - job_id passed in URL params for /report and /download (session unreliable on Render)
+  - job results saved to /tmp/job_<id>.pkl on disk when Phase 2 completes
+  - /report and /download restore from disk if jobs dict was wiped by a worker restart
+  - /progress and /progress-channels also accept job_id query param as fallback
+  - /verify-channels accepts job_id query param as fallback
+  - onerror in loading.html passes job_id in redirect URLs
 """
 
 import os
 import re
+import io
 import json
 import time
+import pickle
 import threading
 from flask import Flask, render_template, request, send_file, session, Response, redirect, url_for
 from dotenv import load_dotenv
@@ -44,6 +54,9 @@ groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 # In-memory job store
 jobs = {}
 
+JOBS_DIR = "/tmp/vci_jobs"
+os.makedirs(JOBS_DIR, exist_ok=True)
+
 
 def fmt_num_filter(n):
     try:
@@ -58,6 +71,51 @@ def fmt_num_filter(n):
 
 
 app.jinja_env.filters["fmt_num"] = fmt_num_filter
+
+
+# ---------------------------------------------------------------------------
+# Disk persistence helpers
+# ---------------------------------------------------------------------------
+
+def _save_job_to_disk(job_id, job_data):
+    """Persist job result dict to disk so it survives worker restarts."""
+    try:
+        path = os.path.join(JOBS_DIR, f"job_{job_id}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump(job_data, f)
+    except Exception as e:
+        print(f"[WARN] Failed to save job {job_id} to disk: {e}")
+
+
+def _load_job_from_disk(job_id):
+    """Restore job result dict from disk. Returns None if not found."""
+    try:
+        path = os.path.join(JOBS_DIR, f"job_{job_id}.pkl")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    except Exception as e:
+        print(f"[WARN] Failed to load job {job_id} from disk: {e}")
+    return None
+
+
+def _ensure_job_in_memory(job_id):
+    """
+    If job_id is not in the in-memory jobs dict, try to restore it from disk.
+    Returns the job dict if found (in memory or on disk), else None.
+    """
+    if job_id in jobs:
+        return jobs[job_id]
+    restored = _load_job_from_disk(job_id)
+    if restored:
+        jobs[job_id] = restored
+        return restored
+    return None
+
+
+def _resolve_job_id():
+    """Get job_id from URL param first, session as fallback."""
+    return request.args.get("job_id") or session.get("job_id")
 
 
 # ---------------------------------------------------------------------------
@@ -180,9 +238,6 @@ def run_channel_finding(job_id, your_company, competitors):
     """
     Phase 1: Only find and verify YouTube channels.
     Stores channel results in jobs[job_id]["channel_data"] when done.
-
-    QuotaExhaustedError: sets quota_exhausted flag so the SSE route can
-    signal loading.html to redirect to /quota-exhausted.
     """
 
     def push(msg):
@@ -217,7 +272,6 @@ def run_channel_finding(job_id, your_company, competitors):
         jobs[job_id]["channels_done"]   = True
 
     except QuotaExhaustedError as e:
-        # All YouTube API keys exhausted — signal the dedicated error page
         jobs[job_id]["quota_exhausted"] = True
         jobs[job_id]["channels_done"]   = True
         push(f"❌ YouTube API quota exhausted: {str(e)}")
@@ -229,23 +283,19 @@ def run_channel_finding(job_id, your_company, competitors):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Full analysis worker (after channel confirmation)
+# Phase 2: Full analysis worker
 # ---------------------------------------------------------------------------
 
 def run_analysis(job_id, your_company, competitors, all_data):
     """
     Phase 2: Full pipeline — transcribe, analyse, insights, quality gate, PPTX.
-    Receives confirmed all_data (with possibly user-corrected channel links).
-
-    QuotaExhaustedError: sets quota_exhausted flag so the SSE route can
-    signal loading.html to redirect to /quota-exhausted.
+    Saves result to disk when complete so it survives Render worker restarts.
     """
 
     def push(msg):
         jobs[job_id]["status"].append(msg)
 
     try:
-        # Step 2: Transcribe / analyse videos
         push("🎬 Downloading and analysing video content...")
         push("   (3-tier: transcript → description → Gemini AI watch)")
         for d in all_data:
@@ -263,23 +313,19 @@ def run_analysis(job_id, your_company, competitors, all_data):
 
         push("✅ Video content analysis complete.")
 
-        # Step 3: Statistical analysis
         push("📊 Running competitive scoring and gap analysis...")
         analysis = analyse_all(all_data, your_company)
         push(f"✅ Ranked {len(analysis.get('ranked', []))} companies. Leader: {analysis.get('leader', 'N/A')}")
 
-        # Step 4: AI insights
         push("🧠 Running strategic reasoning (GPT OSS 120B)...")
         push("✍️  Writing client-ready copy (Llama 3.3 70B)...")
         insights = get_insights(all_data, analysis, your_company)
         push("✅ AI insights complete.")
 
-        # Step 5: Quality gate
         push("🔎 Running quality verification on all report sections...")
         insights = run_quality_gate(insights, all_data, analysis, your_company)
         push("✅ Quality check passed.")
 
-        # Step 6: Build PPTX
         push("📑 Building PowerPoint report (11 slides)...")
         pptx_buf = build_pptx(
             your_company=your_company,
@@ -291,7 +337,7 @@ def run_analysis(job_id, your_company, competitors, all_data):
         push("✅ PowerPoint ready.")
         push("🎉 Report complete! Redirecting...")
 
-        jobs[job_id]["result"] = {
+        result = {
             "your_company": your_company,
             "competitors":  competitors,
             "all_data":     all_data,
@@ -299,17 +345,20 @@ def run_analysis(job_id, your_company, competitors, all_data):
             "insights":     insights,
             "pptx_bytes":   pptx_buf.read()
         }
-        jobs[job_id]["done"] = True
+        jobs[job_id]["result"] = result
+        jobs[job_id]["done"]   = True
+
+        # ── KEY FIX: persist to disk so result survives Render worker restarts ──
+        _save_job_to_disk(job_id, jobs[job_id])
 
     except QuotaExhaustedError as e:
-        # All YouTube API keys exhausted — signal the dedicated error page
         jobs[job_id]["quota_exhausted"] = True
         jobs[job_id]["done"]            = True
         push(f"❌ YouTube API quota exhausted: {str(e)}")
 
     except Exception as e:
-        jobs[job_id]["error"]  = str(e)
-        jobs[job_id]["done"]   = True
+        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["done"]  = True
         push(f"❌ Error: {str(e)}")
 
 
@@ -352,7 +401,7 @@ def generate():
         "done":   False,
         "result": None,
         "error":  None,
-        # Quota flag (set by either phase worker)
+        # Quota flag
         "quota_exhausted": False,
     }
     session["job_id"]       = job_id
@@ -371,14 +420,15 @@ def generate():
         your_company=your_company,
         competitors=competitors,
         phase="channels",
-        job_id=job_id
+        job_id=job_id          # ← pass job_id to template
     )
 
 
 @app.route("/progress-channels")
 def progress_channels():
     """SSE stream for Phase 1 (channel finding)."""
-    job_id = session.get("job_id")
+    # Accept job_id from URL param OR session (Render may drop session)
+    job_id = request.args.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         def empty():
             yield 'data: {"msg": "No job found.", "done": true, "error": true}\n\n'
@@ -394,7 +444,6 @@ def progress_channels():
                 yield f"data: {payload}\n\n"
                 sent += 1
             if job.get("channels_done"):
-                # Check for quota exhaustion first
                 if job.get("quota_exhausted"):
                     payload = json.dumps({
                         "msg":             "❌ All YouTube API keys have exhausted their daily quota.",
@@ -423,7 +472,8 @@ def progress_channels():
 @app.route("/verify-channels")
 def verify_channels():
     """Show found channels to user for verification / editing."""
-    job_id = session.get("job_id")
+    # Accept job_id from URL param OR session
+    job_id = request.args.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         return redirect(url_for("index"))
 
@@ -439,7 +489,8 @@ def verify_channels():
         "verify_channels.html",
         all_data=all_data,
         your_company=your_company,
-        competitors=competitors
+        competitors=competitors,
+        job_id=job_id
     )
 
 
@@ -449,7 +500,7 @@ def confirm_channels():
     User confirms (or corrects) channel links.
     Updates all_data with any user-edited channel URLs, then starts Phase 2.
     """
-    job_id = session.get("job_id")
+    job_id = request.form.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         return redirect(url_for("index"))
 
@@ -464,24 +515,20 @@ def confirm_channels():
         edited_url  = request.form.get(f"channel_url_{company_key}", "").strip()
 
         if edited_url and edited_url != d.get("channel_url_display", ""):
-            # User corrected this channel — refetch ALL data from the new URL.
-            # Gemini verifies accessibility only (no industry check — user is trusted).
-            # This replaces top_videos, recent_videos, stats — everything Phase 2 uses.
             fresh = refetch_channel_from_url(edited_url, d["company_name"])
             if fresh:
                 all_data[i] = fresh
             else:
-                # Refetch failed — keep old data but mark as user-confirmed
                 d["channel_url_override"] = edited_url
                 d["user_confirmed"]       = True
         else:
             d["user_confirmed"] = True
 
     # Reset Phase 2 tracking
-    jobs[job_id]["status"]         = []
-    jobs[job_id]["done"]           = False
-    jobs[job_id]["result"]         = None
-    jobs[job_id]["error"]          = None
+    jobs[job_id]["status"]          = []
+    jobs[job_id]["done"]            = False
+    jobs[job_id]["result"]          = None
+    jobs[job_id]["error"]           = None
     jobs[job_id]["quota_exhausted"] = False
 
     # Start Phase 2 in background
@@ -497,14 +544,15 @@ def confirm_channels():
         your_company=your_company,
         competitors=competitors,
         phase="analysis",
-        job_id=job_id
+        job_id=job_id          # ← pass job_id to template
     )
 
 
 @app.route("/progress")
 def progress():
     """SSE stream for Phase 2 (full analysis)."""
-    job_id = session.get("job_id")
+    # Accept job_id from URL param OR session (Render may drop session)
+    job_id = request.args.get("job_id") or session.get("job_id")
     if not job_id or job_id not in jobs:
         def empty():
             yield 'data: {"msg": "No job found.", "done": true, "error": true}\n\n'
@@ -520,7 +568,6 @@ def progress():
                 yield f"data: {payload}\n\n"
                 sent += 1
             if job.get("done"):
-                # Check for quota exhaustion first
                 if job.get("quota_exhausted"):
                     payload = json.dumps({
                         "msg":             "❌ All YouTube API keys have exhausted their daily quota.",
@@ -554,11 +601,16 @@ def quota_exhausted():
 
 @app.route("/report")
 def report():
+    # ── KEY FIX: get job_id from URL param first, session as fallback ──
     job_id = request.args.get("job_id") or session.get("job_id")
-    if not job_id or job_id not in jobs:
+    if not job_id:
         return redirect(url_for("index"))
 
-    job = jobs[job_id]
+    # ── KEY FIX: restore from disk if Render wiped the in-memory jobs dict ──
+    job = _ensure_job_in_memory(job_id)
+    if not job:
+        return redirect(url_for("index"))
+
     if not job.get("done") or job.get("error"):
         return redirect(url_for("index"))
 
@@ -572,23 +624,28 @@ def report():
         all_data=data["all_data"],
         analysis=data["analysis"],
         insights=data["insights"],
-        fmt_num=fmt_num_filter
+        fmt_num=fmt_num_filter,
+        job_id=job_id
     )
 
 
 @app.route("/download")
 def download():
+    # ── KEY FIX: get job_id from URL param first, session as fallback ──
     job_id = request.args.get("job_id") or session.get("job_id")
-    if not job_id or job_id not in jobs:
+    if not job_id:
         return "No report found. Please generate a report first.", 400
 
-    job = jobs[job_id]
+    # ── KEY FIX: restore from disk if Render wiped the in-memory jobs dict ──
+    job = _ensure_job_in_memory(job_id)
+    if not job:
+        return "No report found. Please generate a report first.", 400
+
     if not job.get("done") or not job.get("result"):
         return "Report not ready yet.", 400
 
     data = job["result"]
-    import io
-    buf = io.BytesIO(data["pptx_bytes"])
+    buf  = io.BytesIO(data["pptx_bytes"])
     buf.seek(0)
 
     filename = f"video_intelligence_{data['your_company'].replace(' ', '_')}.pptx"

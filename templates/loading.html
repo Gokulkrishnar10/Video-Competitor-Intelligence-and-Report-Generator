@@ -82,9 +82,10 @@
   </div>
 
   <script>
-    const PHASE = "{{ phase }}";
-    const JOB_ID = "{{ job_id | default('') }}";
-    const log = document.getElementById('progressLog');
+    const PHASE  = "{{ phase }}";
+    const JOB_ID = "{{ job_id | default('') }}";   // ← passed from Flask, survives session loss
+
+    const log              = document.getElementById('progressLog');
     const currentCompanyEl = document.getElementById('currentCompany');
     const stages = [
       document.querySelector('#stage1 .stage-dot'),
@@ -133,15 +134,19 @@
       }
     }
 
-    // Choose correct SSE endpoint
-    const sseUrl = PHASE === 'channels' ? '/progress-channels' : '/progress';
+    // ── Build SSE URL with job_id param so the server can find the job
+    //    even if the session cookie is gone (Render free-tier ephemeral workers)
+    function buildUrl(path) {
+      return JOB_ID ? path + '?job_id=' + encodeURIComponent(JOB_ID) : path;
+    }
+
+    const sseUrl    = PHASE === 'channels' ? buildUrl('/progress-channels') : buildUrl('/progress');
     const evtSource = new EventSource(sseUrl);
 
     evtSource.onmessage = function(e) {
       const data = JSON.parse(e.data);
 
-      // ── Quota exhausted: all YouTube API keys are spent ──────────────────
-      // This check must come BEFORE the generic done/error handling below
+      // ── Quota exhausted ──────────────────────────────────────────────────
       if (data.quota_exhausted) {
         evtSource.close();
         addLogEntry('⛔ All YouTube API keys have reached their daily quota limit.');
@@ -162,22 +167,60 @@
         } else if (PHASE === 'channels') {
           setStage(2);
           addLogEntry('✅ Channels found! Redirecting to verification...');
-          setTimeout(() => { window.location.href = '/verify-channels'; }, 1000);
+          // ── Pass job_id in the URL so /verify-channels finds the job ──
+          setTimeout(() => { window.location.href = buildUrl('/verify-channels'); }, 1000);
         } else {
           setStage(3);
           addLogEntry('✅ All done! Loading your report...');
-          setTimeout(() => { window.location.href = '/report?job_id=' + encodeURIComponent(JOB_ID); }, 1200);
+          // ── Pass job_id in the URL so /report finds the job ──
+          setTimeout(() => { window.location.href = buildUrl('/report'); }, 1200);
         }
       }
     };
 
+    // ── onerror: SSE dropped (Render closes long connections) ───────────────
+    // Poll /health then redirect — pass job_id so the target route can
+    // restore from disk even if the in-memory jobs dict was wiped.
     evtSource.onerror = function() {
       evtSource.close();
-      addLogEntry('Connection interrupted. Checking status...');
+      addLogEntry('Connection interrupted. Checking if report is ready...');
+
       if (PHASE === 'channels') {
-        setTimeout(() => { window.location.href = '/verify-channels'; }, 2000);
+        // Phase 1 is short — just redirect with job_id
+        setTimeout(() => { window.location.href = buildUrl('/verify-channels'); }, 2000);
       } else {
-        setTimeout(() => { window.location.href = '/report?job_id=' + encodeURIComponent(JOB_ID); }, 2000);
+        // Phase 2 can be 3-4 min. Poll until the job is done on disk.
+        addLogEntry('Analysis still running. Polling every 10 seconds...');
+        let attempts = 0;
+        const maxAttempts = 30;  // up to 5 minutes of polling
+
+        function poll() {
+          attempts++;
+          fetch(buildUrl('/report'), { method: 'HEAD', redirect: 'manual' })
+            .then(res => {
+              // If /report returns 200, the result is ready. Redirect.
+              if (res.status === 200 || res.type === 'opaqueredirect') {
+                addLogEntry('✅ Report ready! Loading now...');
+                window.location.href = buildUrl('/report');
+              } else if (attempts < maxAttempts) {
+                // Not ready yet — keep polling
+                addLogEntry(`Still working... (check ${attempts}/${maxAttempts})`);
+                setTimeout(poll, 10000);
+              } else {
+                addLogEntry('⏱ Timed out. Please try again or check your API keys.');
+                setTimeout(() => { window.location.href = '/'; }, 3000);
+              }
+            })
+            .catch(() => {
+              if (attempts < maxAttempts) {
+                setTimeout(poll, 10000);
+              } else {
+                window.location.href = '/';
+              }
+            });
+        }
+
+        setTimeout(poll, 10000);
       }
     };
   </script>
